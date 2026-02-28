@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import datetime
 from typing import List, Optional, Iterator, Dict, Any
-
-import pyarrow.parquet as pq
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel, ConfigDict
 
 
@@ -35,14 +35,17 @@ class Submission(BaseModel):
     """Pydantic model representing a single competition submission."""
     model_config = ConfigDict(from_attributes=True)
     
-    submission_id: int
+    id: int
     leaderboard_id: int
-    user_id: int
+    user_id: str
     submission_time: datetime.datetime
     file_name: str
-    code: bytes
     code_id: int
-    run_id: int
+    status: str
+    done: Optional[bool] = None
+    
+    # Run information (joined from runs table)
+    run_id: Optional[int] = None
     run_start_time: Optional[datetime.datetime] = None
     run_end_time: Optional[datetime.datetime] = None
     run_mode: Optional[str] = None
@@ -54,57 +57,85 @@ class Submission(BaseModel):
 
 class CompetitionDataset:
     """
-    An extremely fast, memory-efficient API for large parquet files.
-    Optimized for speed by using column projection and memory mapping.
+    An API for interacting with the competition database.
+    Refactored to consume data from PostgreSQL instead of Parquet.
     """
 
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        # memory_map=True allows the OS to handle file caching efficiently
-        self.parquet_file = pq.ParquetFile(file_path, memory_map=True)
-        self._total_rows = self.parquet_file.metadata.num_rows
-        # Pre-fetch schema columns to avoid repeated metadata lookups
-        self._columns = self.parquet_file.schema.names
+    def __init__(self, database_url: str, schema: str = "leaderboard"):
+        self.database_url = database_url
+        self._conn = None
+        self._schema = schema
+
+    def _get_connection(self):
+        """Internal method to manage and return a database connection."""
+        if self._conn is None or self._conn.closed:
+            self._conn = psycopg2.connect(self.database_url, sslmode="require")
+        return self._conn
 
     def __len__(self) -> int:
-        """Returns the total number of entries instantly from metadata."""
-        return self._total_rows
+        """Returns the total number of submissions instantly from the database."""
+        conn = self._get_connection()
+        with conn.cursor() as cur:
+            cur.execute(f'SELECT COUNT(*) FROM "{self._schema}"."submission";')
+            return cur.fetchone()[0]
+
+    def _get_submission_query(self) -> str:
+        """Returns the base SQL query for submissions with joined run data."""
+        return f"""
+            SELECT 
+                s.id, s.leaderboard_id, s.user_id, s.submission_time, s.file_name, s.code_id, s.status, s.done,
+                r.id as run_id, r.start_time as run_start_time, r.end_time as run_end_time, 
+                r.mode as run_mode, r.score as run_score, r.passed as run_passed,
+                r.meta as run_meta, r.system_info as run_system_info
+            FROM "{self._schema}"."submission" s
+            LEFT JOIN "{self._schema}"."runs" r ON s.id = r.submission_id
+        """
 
     def sample_submissions(self, batch_size: int = 10) -> List[Submission]:
         """
-        Returns a sample of submissions extremely fast.
+        Returns a sample of submissions.
         
-        Optimization: Uses column projection to ensure only the necessary columns 
-        for the first few rows are read from the disk.
+        Optimization: Uses SQL LIMIT to ensure only the necessary records are fetched.
         """
-        if self._total_rows == 0:
-            return []
-            
-        # We explicitly pass the columns we want to read. 
-        # Even though we want all of them, being explicit helps pyarrow's internal router.
-        reader = self.parquet_file.iter_batches(
-            batch_size=batch_size, 
-            columns=self._columns
-        )
-        
-        try:
-            first_batch = next(reader)
-            records = first_batch.to_pylist()
-            return [Submission(**record) for record in records]
-        except StopIteration:
-            return []
+        conn = self._get_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            query = self._get_submission_query() + " LIMIT %s"
+            cur.execute(query, (batch_size,))
+            records = cur.fetchall()
+            return [Submission(**dict(record)) for record in records]
 
     def __iter__(self) -> Iterator[Submission]:
         """
-        Lazily iterates through the parquet file with a small batch size.
+        Lazily iterates through all submissions using a server-side cursor.
         """
-        for batch in self.parquet_file.iter_batches(batch_size=10, columns=self._columns):
-            for record in batch.to_pylist():
-                yield Submission(**record)
+        conn = self._get_connection()
+        # Named cursor ensures server-side fetching, avoiding loading everything into memory
+        cursor_name = f"sub_iter_{id(self)}"
+        with conn.cursor(name=cursor_name, cursor_factory=RealDictCursor) as cur:
+            cur.execute(self._get_submission_query())
+            while True:
+                records = cur.fetchmany(size=10)
+                if not records:
+                    break
+                for record in records:
+                    yield Submission(**dict(record))
 
     def iter_batches(self, batch_size: int = 10) -> Iterator[List[Submission]]:
         """
         Iterates through the dataset in batches.
         """
-        for batch in self.parquet_file.iter_batches(batch_size=batch_size, columns=self._columns):
-            yield [Submission(**record) for record in batch.to_pylist()]
+        conn = self._get_connection()
+        cursor_name = f"batch_iter_{id(self)}"
+        with conn.cursor(name=cursor_name, cursor_factory=RealDictCursor) as cur:
+            cur.execute(self._get_submission_query())
+            while True:
+                records = cur.fetchmany(size=batch_size)
+                if not records:
+                    break
+                yield [Submission(**dict(record)) for record in records]
+
+    def close(self):
+        """Closes the database connection and cleans up resources."""
+        if self._conn and not self._conn.closed:
+            self._conn.close()
+            self._conn = None
